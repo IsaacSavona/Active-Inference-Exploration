@@ -1,0 +1,15 @@
+[project]
+name = "active-inference-exploration"
+version = "0.1.0"
+description = "Exploring active inference (and adjacent) theories through practical applications"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=2.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6.9",
+    "mypy>=1.12.0",
+]
