@@ -5,7 +5,9 @@ description = "Exploring active inference (and adjacent) theories through practi
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+    "matplotlib>=3.9.4",
     "numpy>=2.0.2",
+    "tqdm>=4.67.3",
 ]
 
 [project.optional-dependencies]
