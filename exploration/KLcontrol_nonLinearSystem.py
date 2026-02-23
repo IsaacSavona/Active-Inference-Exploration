@@ -485,11 +485,16 @@ def compute_optimal_policy(time_index, state, horizon, num_samples_per_control=1
     control_costs = R_CONTROL * np.abs(INPUT_SPACE)
     log_weights = log_noise_probs - control_costs + log_Z_values
 
+    # Log-desirability of current state: log A_ρ̄[Z](k,x)
+    # This is log Σ_u [ρ(u) · exp(-r(u)) · Z(k+1, f(x,u))]
+    max_lw = np.max(log_weights)
+    log_desirability = max_lw + np.log(np.sum(np.exp(log_weights - max_lw)))
+
     # Softmax → probability distribution π*_k(u|x)
-    log_weights -= np.max(log_weights)
+    log_weights -= max_lw
     policy_distribution = np.exp(log_weights) / np.sum(np.exp(log_weights))
 
-    return policy_distribution
+    return policy_distribution, log_desirability
 
 
 def sample_control_from_policy(policy_distribution):
@@ -518,19 +523,23 @@ def sample_control_from_policy(policy_distribution):
 
 def simulation():
     """
-    Run the full KL control simulation and record state/control history.
+    Run the full KL control simulation and record state/control/policy history.
 
     Returns:
         state_history: (TOTAL_SIMULATION_TIME+1, 4) array of states
         control_history: (TOTAL_SIMULATION_TIME,) array of applied controls
+        policy_history: (TOTAL_SIMULATION_TIME, |U|) array of policy distributions
+        log_desirability_history: (TOTAL_SIMULATION_TIME,) array of log Z values
     """
     state = INITIAL_STATE.copy()
     state_history = [state.copy()]
     control_history = []
+    policy_history = []
+    log_desirability_history = []
 
     pbar = tqdm(range(TOTAL_SIMULATION_TIME), desc="KL control", unit="step")
     for i in pbar:
-        policy = compute_optimal_policy(
+        policy, log_desirability = compute_optimal_policy(
             time_index=0, state=state, horizon=HORIZON
         )
         control_input = sample_control_from_policy(policy_distribution=policy)
@@ -539,16 +548,290 @@ def simulation():
 
         state_history.append(state.copy())
         control_history.append(control_input)
+        policy_history.append(policy.copy())
+        log_desirability_history.append(log_desirability)
 
         pbar.set_postfix_str(
             f"x={state[0]:+.2f} θ={state[2]:+.2f} u={control_input:+.0f}"
         )
 
-    return np.array(state_history), np.array(control_history)
+    return (
+        np.array(state_history),
+        np.array(control_history),
+        np.array(policy_history),
+        np.array(log_desirability_history),
+    )
 
 
 # =============================================================================
-# SECTION 13: ANIMATION
+# SECTION 13: DIAGNOSTIC METRICS
+# Paper connections noted below for each metric.
+# =============================================================================
+
+def plot_metrics(state_history, control_history, policy_history,
+                 log_desirability_history):
+    """
+    Plot five diagnostic metrics that demonstrate KL control is working.
+
+    Panels:
+    1. Cumulative stage cost — should flatten as the controller stabilizes.
+    2. Policy entropy H(π*_k) — starts high (uncertain), decreases near
+       equilibrium as the policy becomes more confident.
+    3. KL(π*_k || ρ_w) — how much the optimal policy deviates from the
+       uncontrolled noise prior.  High when active control is needed,
+       decreases near equilibrium.
+    4. State norm ||x||₂ — should converge toward 0.
+    5. Log-desirability log Z(k,x) — increases as the state improves
+       (more "desirable" futures from better states).
+
+    Args:
+        state_history:             (T+1, 4) state trajectory
+        control_history:           (T,)     applied forces
+        policy_history:            (T, |U|) optimal policy distributions
+        log_desirability_history:  (T,)     log Z at each step
+    """
+    num_steps = len(control_history)
+    time_vec = np.arange(num_steps) * TIMESTEP
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 10))
+    fig.suptitle("KL Control — Diagnostic Metrics", fontsize=14, y=0.98)
+
+    # ── 1. Cumulative stage cost ──
+    # ℓ_k(x_k) summed over time; should flatten as the system stabilizes
+    ax = axes[0, 0]
+    costs = np.array([stage_cost(s) for s in state_history[:num_steps]])
+    cumulative_cost = np.cumsum(costs)
+    ax.plot(time_vec, cumulative_cost, color="tab:blue")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("Σ ℓ(x)")
+    ax.set_title("Cumulative Stage Cost")
+    ax.grid(True, alpha=0.3)
+
+    # ── 2. Policy entropy H(π*_k) ──
+    # Shannon entropy: H(π) = −Σ π(u) ln π(u)
+    # High early on (exploration / uncertainty), decreases as the system
+    # approaches equilibrium and the policy concentrates on fewer actions.
+    ax = axes[0, 1]
+    entropies = np.zeros(num_steps)
+    for i, pi in enumerate(policy_history):
+        mask = pi > 0
+        entropies[i] = -np.sum(pi[mask] * np.log(pi[mask]))
+    ax.plot(time_vec, entropies, color="tab:orange")
+    # Reference: maximum entropy for uniform distribution over |U|
+    max_entropy = np.log(len(INPUT_SPACE))
+    ax.axhline(max_entropy, color="grey", ls="--", lw=0.8,
+               label=f"H_max = ln|U| = {max_entropy:.2f}")
+    # Reference: noise prior entropy H(ρ_w) — theoretical floor for π*
+    # Optimal policy cannot have lower entropy (Problem 3.1:
+    # deterministic policies incur infinite KL cost)
+    noise_entropy = -np.sum(_NOISE_PROBS * np.log(_NOISE_PROBS))
+    ax.axhline(noise_entropy, color="tab:red", ls="--", lw=1.0,
+               label=f"H(ρ_w) = {noise_entropy:.2f} (floor)")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("H(π*)")
+    ax.set_title("Policy Entropy (should floor at H(ρ_w), never → 0)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # ── 3. KL divergence KL(π*_k || ρ_w) ──
+    # Measures how much the optimal policy deviates from the uncontrolled
+    # noise prior ρ_w.  From Equation (13), the policy re-weights ρ_w by
+    # desirability; this KL quantifies the "effort" of control.
+    ax = axes[1, 0]
+    kl_divs = np.zeros(num_steps)
+    for i, pi in enumerate(policy_history):
+        mask = pi > 0
+        kl_divs[i] = np.sum(
+            pi[mask] * (np.log(pi[mask]) - np.log(_NOISE_PROBS[mask]))
+        )
+    ax.plot(time_vec, kl_divs, color="tab:red")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("KL(π* || ρ_w)")
+    ax.set_title("KL Divergence from Noise Prior")
+    ax.grid(True, alpha=0.3)
+
+    # ── 4. State norm ||x||₂ ──
+    # Should converge toward 0 (upright equilibrium at origin)
+    ax = axes[1, 1]
+    state_norms = np.linalg.norm(state_history[:num_steps], axis=1)
+    ax.plot(time_vec, state_norms, color="tab:green")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("||x||₂")
+    ax.set_title("State Norm")
+    ax.grid(True, alpha=0.3)
+
+    # ── 5. Log-desirability log Z(k,x) ──
+    # log A_ρ̄[Z](k,x) from Theorem 4.1.  Should increase as the state
+    # improves, reflecting more "desirable" reachable futures.
+    ax = axes[2, 0]
+    ax.plot(time_vec, log_desirability_history, color="tab:purple")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("log Z")
+    ax.set_title("Log-Desirability")
+    ax.grid(True, alpha=0.3)
+
+    # Hide the unused subplot
+    axes[2, 1].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig("exploration/metrics.png", dpi=150, bbox_inches="tight")
+    print(f"\nMetrics figure saved to exploration/metrics.png")
+    plt.show()
+
+
+# =============================================================================
+# SECTION 13b: PAPER VALIDATION METRICS
+# Reproduces key figures from Ito & Kashima (2022):
+#   - MC convergence of V(0, x₀) (cf. Fig. 1)
+#   - Multi-trajectory overlay in x̄-θ plane (cf. Fig. 4)
+#   - Mean ± 1σ bands for state components (cf. Fig. 5)
+# =============================================================================
+
+def plot_paper_validation_metrics(num_seeds=10, multi_steps=80,
+                                  multi_samples=500):
+    """
+    Generate paper validation metrics and save to
+    exploration/paper_validation_metrics.png.
+
+    1. MC convergence: V(0, x₀) = -log Z(0, x₀) vs sample count with
+       error bars (10 reps each). Validates MC estimation converges.
+    2. Multi-trajectory overlay: all seeds plotted in x̄-θ phase plane.
+       All should converge toward origin.
+    3-4. Mean ± 1σ bands of state components over time. Means → 0,
+         stds plateau (confirming stochastic policy doesn't collapse).
+
+    Args:
+        num_seeds: number of independent simulation runs
+        multi_steps: simulation length per seed (reduced for speed)
+        multi_samples: MC samples per control (reduced for speed)
+    """
+    print("\n" + "=" * 60)
+    print("Computing paper validation metrics...")
+    print(f"  MC convergence: 6 sample counts × 10 reps")
+    print(f"  Multi-seed: {num_seeds} seeds × {multi_steps} steps, "
+          f"{multi_samples} samples/ctrl")
+    print("=" * 60)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Paper Validation Metrics (Ito & Kashima 2022)",
+                 fontsize=14, y=0.98)
+
+    # ── Panel 1: MC Convergence of V(0, x₀) (cf. Fig. 1) ──
+    # V(k, x) = -log Z(k, x) is the value function.
+    # As num_samples → ∞, the MC estimate should converge; variance
+    # should shrink as O(1/√N).
+    ax = axes[0, 0]
+    sample_counts = [100, 500, 1000, 2000, 5000, 10000]
+    num_reps = 10
+    v_means = []
+    v_stds = []
+
+    print("\n[1/3] MC convergence...")
+    for n in tqdm(sample_counts, desc="Sample counts"):
+        values = []
+        for _ in range(num_reps):
+            log_z = compute_desirability_function(
+                0, INITIAL_STATE, HORIZON, num_samples=n
+            )
+            values.append(-log_z)  # V = -log Z
+        v_means.append(np.mean(values))
+        v_stds.append(np.std(values))
+
+    ax.errorbar(sample_counts, v_means, yerr=v_stds,
+                marker='o', capsize=5, color='tab:blue', lw=1.5)
+    ax.set_xlabel("Number of MC samples")
+    ax.set_ylabel("V(0, x₀) = −log Z(0, x₀)")
+    ax.set_title("MC Convergence of Value Function (cf. Fig. 1)")
+    ax.set_xscale('log')
+    ax.grid(True, alpha=0.3)
+
+    # ── Multi-seed simulation (shared data for panels 2-4) ──
+    print(f"\n[2/3] Running {num_seeds} simulations "
+          f"({multi_steps} steps each)...")
+    all_histories = []
+    for seed in tqdm(range(num_seeds), desc="Multi-seed sims"):
+        np.random.seed(seed + 42)
+        state = INITIAL_STATE.copy()
+        history = [state.copy()]
+        for _ in range(multi_steps):
+            policy, _ = compute_optimal_policy(
+                time_index=0, state=state, horizon=HORIZON,
+                num_samples_per_control=multi_samples,
+            )
+            control = sample_control_from_policy(policy)
+            state = dynamics_step(state, control)
+            history.append(state.copy())
+        all_histories.append(np.array(history))
+
+    # (num_seeds, multi_steps+1, 4)
+    all_states = np.array(all_histories)
+    time_vec = np.arange(multi_steps + 1) * TIMESTEP
+
+    # ── Panel 2: Trajectory overlay in x̄-θ plane (cf. Fig. 4) ──
+    ax = axes[0, 1]
+    for i, hist in enumerate(all_histories):
+        label = (f"seed {i}" if i < 3
+                 else ("_nolegend_" if i < num_seeds - 1
+                       else f"… {num_seeds} total"))
+        ax.plot(hist[:, 0], hist[:, 2], alpha=0.6, lw=1.0, label=label)
+    ax.plot(INITIAL_STATE[0], INITIAL_STATE[2], 'rs',
+            markersize=10, zorder=5, label="start")
+    ax.plot(0, 0, 'k*', markersize=15, zorder=5, label="target (origin)")
+    ax.set_xlabel("Cart position x̄ (m)")
+    ax.set_ylabel("Pole angle θ (rad)")
+    ax.set_title(f"Trajectory Overlay — {num_seeds} seeds, "
+                 f"{multi_steps} steps (cf. Fig. 4)")
+    ax.legend(fontsize=7, loc="upper right")
+    ax.grid(True, alpha=0.3)
+
+    # ── Panel 3: Mean ± 1σ — position states (cf. Fig. 5) ──
+    print("\n[3/3] Plotting statistics...")
+    state_labels = ["x̄ (m)", "x̄̇ (m/s)", "θ (rad)", "θ̇ (rad/s)"]
+    colors = ["tab:blue", "tab:cyan", "tab:red", "tab:orange"]
+
+    ax = axes[1, 0]
+    for j in [0, 1]:
+        mean = all_states[:, :, j].mean(axis=0)
+        std = all_states[:, :, j].std(axis=0)
+        ax.plot(time_vec, mean, color=colors[j],
+                label=state_labels[j], lw=1.5)
+        ax.fill_between(time_vec, mean - std, mean + std,
+                        color=colors[j], alpha=0.2)
+    ax.axhline(0, color="grey", ls="--", lw=0.8)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("value")
+    ax.set_title("Mean ± 1σ — Position States (cf. Fig. 5)\n"
+                 "σ plateau confirms stochastic policy")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # ── Panel 4: Mean ± 1σ — angle states (cf. Fig. 5) ──
+    ax = axes[1, 1]
+    for j in [2, 3]:
+        mean = all_states[:, :, j].mean(axis=0)
+        std = all_states[:, :, j].std(axis=0)
+        ax.plot(time_vec, mean, color=colors[j],
+                label=state_labels[j], lw=1.5)
+        ax.fill_between(time_vec, mean - std, mean + std,
+                        color=colors[j], alpha=0.2)
+    ax.axhline(0, color="grey", ls="--", lw=0.8)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("value")
+    ax.set_title("Mean ± 1σ — Angle States (cf. Fig. 5)\n"
+                 "σ plateau confirms stochastic policy")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig("exploration/paper_validation_metrics.png",
+                dpi=150, bbox_inches="tight")
+    print(f"\nPaper validation metrics saved to "
+          f"exploration/paper_validation_metrics.png")
+    plt.show()
+
+
+# =============================================================================
+# SECTION 14: ANIMATION
 # =============================================================================
 
 def animate_cart_pole(state_history, control_history):
@@ -694,5 +977,7 @@ if __name__ == "__main__":
           f"Samples/control: 1000, |U|={len(INPUT_SPACE)}")
     print(f"  Workers: {NUM_WORKERS}\n")
 
-    state_hist, ctrl_hist = simulation()
+    state_hist, ctrl_hist, policy_hist, log_z_hist = simulation()
+    plot_metrics(state_hist, ctrl_hist, policy_hist, log_z_hist)
+    plot_paper_validation_metrics()
     animate_cart_pole(state_hist, ctrl_hist)
