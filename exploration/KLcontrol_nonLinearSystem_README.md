@@ -11,82 +11,54 @@ Below is a detailed flowchart showing the major components and computational ste
 
 ```mermaid
 flowchart TD
-  subgraph SENSING
-    O[Observations y_t]
-    NOISE_Y[(Sensory noise)]
+  %% Sensing and recognition
+  SENS[Observations y_t]
+  NOISE[(Sensory noise)]
+  SENS --> RECOG[Recognition / belief update]
+  NOISE --> SENS
+
+  %% Generative model forward simulation (used for predictions and for candidate next-states)
+  GEN["Generative model f(x,u) and observation model g(x)"]
+  RECOG --> GEN
+
+  %% Control: evaluate each candidate control, form policy, sample
+  subgraph CONTROL[Control / Policy]
+    MC["Monte Carlo desirability per u: logZ_u = log E_{noise paths}( exp(-Σ_s ℓ(xbar_s)) )"]
+    LOGW["Compute log-weights: log w(u) = log rho(u) - r(u) + logZ_u"]
+    SOFT["Softmax: π_k(u) ∝ exp(log w(u))"]
+    SAMPLE["Sample u ~ π_k"]
   end
 
-  subgraph GENERATIVE
-    G[Generative model]
-    PRED[Prediction]
-    SIM[Simulation]
-  end
+  %% Dataflow: use belief to form candidate next states, evaluate desirability, then act
+  RECOG --> CAND["Form candidate next-states x' = f(x,u) for u in U"]
+  CAND --> MC
+  MC --> LOGW --> SOFT --> SAMPLE
+  SAMPLE --> APPLY[Apply action u to system]
+  APPLY --> GEN
 
-  subgraph RECOGNITION
-    B[Belief]
-    UPDATE[Belief update]
-    ESTIMATE[State estimation]
-  end
+  %% Logging / diagnostics
+  SAMPLE --> DIAG[Animated diagnostics: policy bars, log-weights, entropy, regret]
 
-  subgraph CONTROL
-    OBJ[Objective]
-    EVAL[Policy evaluation: Monte Carlo desirability]
-    SAMPLE[Sample action from policy]
-    CONSTRAIN[Implicit constraints: discrete action set and control cost]
-  end
-
-  subgraph LOGGING
-    PLOT[Plots / Trajectories / Diagnostics]
-    SAVE[Optional: save arrays or figures]
-  end
-
-  %% sensory path
-  O -->|noisy measurement| RECOGNITION
-  NOISE_Y --> O
-
-  %% belief <-> generative
-  B --> PRED
-  PRED -->|compare| UPDATE
-  O -->|compare| UPDATE
-  UPDATE --> ESTIMATE
-  ESTIMATE --> B
-
-  %% control loop
-  B --> G
-  G --> SIM
-  SIM --> PRED
-  PRED --> OBJ
-  OBJ --> GRAD
-  GRAD --> ACT
-  ACT --> CONSTRAIN --> G
-
-  %% logging
-  B --> PLOT
-  ACT --> PLOT
-  PLOT --> SAVE
-
-  %% annotations
-  classDef comp fill:#702670,stroke:#333,stroke-width:1px;
-  class G,GRAD,UPDATE comp;
-
-  %% detailed notes as subgraph of steps
-  subgraph STEPS[Computation per time-step]
-    A1([Predict forward over planning horizon])
-    A2([Compute predicted sensory distribution])
-    A3([Evaluate control objective])
-    A4([Compute gradients])
-    A5([Update actions])
-    A6([Apply action and update belief])
-  end
-
-  SIM --> A1 --> A2 --> A3 --> A4 --> A5 --> A6 --> O
-
-  %% click links removed to avoid Mermaid runtime parsing issues
-
+  classDef impl fill:#943725,stroke:#222,stroke-width:1px;
+  class MC,LOGW,SOFT,SAMPLE impl;
 ``` 
 
 ## What this file does
 - Implements an active-inference / KL-control controller for a nonlinear system. It contains: model definitions (nonlinear dynamics and observation model), a state-estimation routine (recognition model), and a control loop that optimises actions to minimise a KL-based objective over a planning horizon.
+
+### Key equations used (implementation)
+
+- Policy (implemented):
+
+  $\pi^*_k(u; x) \propto \rho(u) \; e^{-r(u)} \; Z\big(k+1, f(x,u)\big)$
+
+  where $Z(k,x)$ is the desirability function estimated by Monte Carlo.
+
+- Desirability (Monte Carlo estimator, implemented as log-sum-exp):
+
+  $\log Z(k,x) = \log \mathbb{E}_{\text{noise paths}}\Big[\exp\big(-\sum_{s=k}^N \ell(x_s)\big)\Big]$
+
+  (computed by simulating many noise-driven trajectories from $x$ and using the log-sum-exp trick for numerical stability)
 
 ## How to run
 - Ensure Python 3.8+ and typical scientific packages are installed (numpy, scipy, matplotlib). If you use a virtual environment, activate it first.
